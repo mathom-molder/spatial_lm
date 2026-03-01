@@ -1,26 +1,30 @@
 """
-Spatial Language Model — Direction 3 (v2: per-head learned distance scales).
+Spatial Language Model — Direction 3 (v3: token-space positions).
 
-Each attention head has a single learned scalar (distance_scale) that controls
-how much it penalises attending to distant sequence positions:
+Each vocabulary token has a learnable 3D coordinate. Attention is penalised
+by the Euclidean distance between the tokens being attended to/from, not by
+sequence position.
 
-    logit(i→j) = (Q_i · K_j) / sqrt(d) - distance_scale_h * |i - j|
+    logit(i→j) = (Q_i · K_j) / sqrt(d) - distance_penalty * ||pos[tok_i] - pos[tok_j]||
 
-The distances are fixed (|i - j|, the integer sequence gap) — no learned 3D
-positions, no repulsion term. The model learns *how local* each head should be
-purely from the language modelling objective.
+Key difference from v1 (sequence positions) and v2 (per-head scales):
 
-If distance_scale_h is large and positive:  head attends locally.
-If distance_scale_h is near zero:           head behaves like standard attention.
-If distance_scale_h is negative:            head prefers long-range attention.
+  v1 — positions indexed by sequence slot. Sequence slot 20 means different
+       things in every batch example → noisy gradient → positions collapse.
 
-The key diagnostic is the learned scale heatmap (n_layers × n_heads) after
-training. If the idea works, heads will spread across a range of scales — some
-local, some global — and this specialisation should improve val loss over a
-standard transformer.
+  v2 — fixed |i-j| distances, learned per-head scale. Works, but purely
+       positional — no information about which tokens are attending.
 
-Set energy_weight=0, flop_weight=0 (defaults) to let scales learn from CE alone.
-Set energy_weight > 0 to additionally penalise long-range attention in the loss.
+  v3 — positions indexed by vocabulary token. 'e' is always 'e'.
+       Tokens that frequently attend to each other get pulled spatially
+       close. This is the original spiking network intuition: neurons with
+       stable identities cluster by co-activation.
+
+The model learns a 3D map of its vocabulary. Characters with similar
+roles in the language (vowels, consonants, punctuation, capitals) should
+cluster together if the idea works.
+
+Repulsion (Coulomb 1/d over all vocab pairs) prevents collapse.
 """
 
 import math
@@ -31,46 +35,34 @@ import torch.nn.functional as F
 
 class SpatialAttention(nn.Module):
     """
-    Multi-head attention with per-head learned distance scaling.
+    Multi-head attention with token-space distance penalty.
 
-    The attention logit from position i to position j is:
-        logit(i→j) = (Q_i · K_j) / sqrt(d) - distance_scale_h * |i - j|
-
-    distance_scale_h is a learned scalar per head, initialized to
-    distance_scale_init. Gradient descent will push it up (more local) or
-    down toward zero/negative (more global) based on what helps the task.
-
-    Distances are fixed: dist[i,j] = |i - j|, stored as a non-trainable buffer.
+    Receives pre-computed pairwise token distances (B, T, T) and subtracts
+    distance_penalty * dist[i,j] from the logit for attending from position i
+    (containing some token a) to position j (containing some token b).
     """
 
-    def __init__(self, d_model, n_heads, seq_len, distance_scale_init=0.1):
+    def __init__(self, d_model, n_heads, seq_len, distance_penalty=1.0):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.distance_penalty = distance_penalty
         self.max_entropy = math.log(seq_len)
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.proj = nn.Linear(d_model, d_model, bias=False)
 
-        # Per-head learned distance scale — one scalar per head.
-        # Initialized small so training starts close to a standard transformer.
-        self.distance_scales = nn.Parameter(
-            torch.full((n_heads,), distance_scale_init)
-        )
-
-        # Fixed distance matrix: dist[i,j] = |i - j|
-        i = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)
-        j = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0)
-        self.register_buffer('seq_dists', torch.abs(i - j))  # (seq_len, seq_len)
-
-        # Causal mask
         self.register_buffer(
             'causal_mask',
             torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
         )
 
-    def forward(self, x):
+    def forward(self, x, token_dists):
+        """
+        x:           (B, T, C)
+        token_dists: (B, T, T) pairwise 3D distances between tokens
+        """
         B, T, C = x.shape
 
         q, k, v = self.qkv(x).split(C, dim=-1)
@@ -78,41 +70,31 @@ class SpatialAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        # Scaled dot-product logits
         attn_logits = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B, H, T, T)
 
-        # Fixed sequence distances
-        dists = self.seq_dists[:T, :T]  # (T, T)
+        # Token-space distance penalty, broadcast over heads
+        attn_logits = attn_logits - self.distance_penalty * token_dists.unsqueeze(1)
 
-        # Per-head distance penalty: subtract scale_h * |i-j| from each head's logits
-        scales = self.distance_scales.view(1, self.n_heads, 1, 1)  # broadcast over B, T, T
-        attn_logits = attn_logits - scales * dists
-
-        # Causal mask
         attn_logits = attn_logits.masked_fill(self.causal_mask[:T, :T], float('-inf'))
-
         attn_weights = F.softmax(attn_logits, dim=-1)  # (B, H, T, T)
 
-        # ── Distance energy ────────────────────────────────────────────────
-        # Average sequence distance of the attended token per query.
-        # Low = local attention; high = global attention.
-        dist_energy = (attn_weights * dists).sum(dim=-1).mean()
+        # Distance energy: expected token-space distance of attended token
+        dist_energy = (attn_weights * token_dists.unsqueeze(1)).sum(dim=-1).mean()
 
-        # ── FLOP energy (attention entropy) ───────────────────────────────
-        # H = -Σ_j w(i→j)·log w(i→j). Higher = more diffuse = more FLOPs.
+        # FLOP energy (attention entropy)
         flop_energy = -(attn_weights * torch.log(attn_weights + 1e-9)).sum(dim=-1).mean()
 
         out = (attn_weights @ v).transpose(1, 2).contiguous().view(B, T, C)
-        return self.proj(out), dist_energy, flop_energy, attn_weights.detach(), dists.detach()
+        return self.proj(out), dist_energy, flop_energy, attn_weights.detach(), token_dists.detach()
 
 
 class SpatialBlock(nn.Module):
-    """Transformer block: spatial attention + feedforward."""
+    """Transformer block: token-space spatial attention + feedforward."""
 
-    def __init__(self, d_model, n_heads, seq_len, distance_scale_init=0.1, dropout=0.1):
+    def __init__(self, d_model, n_heads, seq_len, distance_penalty=1.0, dropout=0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = SpatialAttention(d_model, n_heads, seq_len, distance_scale_init)
+        self.attn = SpatialAttention(d_model, n_heads, seq_len, distance_penalty)
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -122,8 +104,8 @@ class SpatialBlock(nn.Module):
         )
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, x):
-        attn_out, dist_energy, flop_energy, weights, dists = self.attn(self.ln1(x))
+    def forward(self, x, token_dists):
+        attn_out, dist_energy, flop_energy, weights, dists = self.attn(self.ln1(x), token_dists)
         x = x + self.drop(attn_out)
         x = x + self.ffn(self.ln2(x))
         return x, dist_energy, flop_energy, weights, dists
@@ -131,14 +113,13 @@ class SpatialBlock(nn.Module):
 
 class SpatialLanguageModel(nn.Module):
     """
-    Character-level autoregressive language model with per-head distance scaling.
+    Character-level language model where each vocabulary token has a
+    learnable 3D coordinate. Attention logits are penalised by the
+    Euclidean distance between the attending and attended token's positions.
 
-    Each head in each layer learns a scalar that controls its locality preference.
-    After training, read out model.get_distance_scales() to see what the model
-    learned: which heads went local, which stayed global.
-
-    Set energy_weight=0, flop_weight=0 to train with no explicit regularisation
-    (scales learn purely from cross-entropy). This is the cleanest experiment.
+    After training, call get_token_positions() to see the learned 3D map
+    of the vocabulary. Characters that frequently attend to each other
+    should cluster together.
     """
 
     def __init__(
@@ -148,23 +129,34 @@ class SpatialLanguageModel(nn.Module):
         d_model=128,
         n_heads=4,
         n_layers=4,
-        distance_scale_init=0.1,
+        d_space=3,
+        distance_penalty=1.0,
         energy_weight=0.0,
         flop_weight=0.0,
+        repulsion_weight=0.01,
         dropout=0.1,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.d_model = d_model
+        self.vocab_size = vocab_size
         self.energy_weight = energy_weight
         self.flop_weight = flop_weight
+        self.repulsion_weight = repulsion_weight
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(seq_len, d_model)
         self.drop = nn.Dropout(dropout)
 
+        # Learnable 3D position for each vocabulary token.
+        # Initialized in a small ball; gradient descent will spread them
+        # into a map where frequently co-attending tokens cluster together.
+        self.token_positions = nn.Parameter(
+            torch.randn(vocab_size, d_space) * 0.3
+        )
+
         self.blocks = nn.ModuleList([
-            SpatialBlock(d_model, n_heads, seq_len, distance_scale_init, dropout)
+            SpatialBlock(d_model, n_heads, seq_len, distance_penalty, dropout)
             for _ in range(n_layers)
         ])
 
@@ -185,6 +177,14 @@ class SpatialLanguageModel(nn.Module):
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
 
+    def _repulsion_energy(self):
+        """Coulomb-style repulsion over all vocab pairs to prevent collapse."""
+        pos = self.token_positions  # (V, d_space)
+        diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (V, V, d_space)
+        dists = torch.norm(diff, dim=-1)  # (V, V)
+        eye = torch.eye(self.vocab_size, dtype=torch.bool, device=pos.device)
+        return (1.0 / (dists[~eye] + 1e-4)).mean()
+
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
@@ -192,13 +192,21 @@ class SpatialLanguageModel(nn.Module):
         pos = self.pos_emb(torch.arange(T, device=idx.device))
         x = self.drop(tok + pos)
 
-        total_dist_energy  = torch.tensor(0.0, device=idx.device)
-        total_flop_energy  = torch.tensor(0.0, device=idx.device)
+        # Look up 3D positions for each token in the sequence,
+        # then compute all pairwise distances in one shot.
+        seq_pos = self.token_positions[idx]           # (B, T, d_space)
+        diff = seq_pos.unsqueeze(2) - seq_pos.unsqueeze(1)  # (B, T, T, d_space)
+        token_dists = torch.norm(diff, dim=-1)        # (B, T, T)
+
+        repulsion_energy = self._repulsion_energy()
+
+        total_dist_energy = torch.tensor(0.0, device=idx.device)
+        total_flop_energy = torch.tensor(0.0, device=idx.device)
         all_weights = []
         all_dists = []
 
         for block in self.blocks:
-            x, dist_energy, flop_energy, weights, dists = block(x)
+            x, dist_energy, flop_energy, weights, dists = block(x, token_dists)
             total_dist_energy = total_dist_energy + dist_energy
             total_flop_energy = total_flop_energy + flop_energy
             all_weights.append(weights)
@@ -211,42 +219,34 @@ class SpatialLanguageModel(nn.Module):
         if targets is not None:
             ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             loss = (ce
-                    + self.energy_weight * total_dist_energy
-                    + self.flop_weight   * total_flop_energy)
+                    + self.energy_weight    * total_dist_energy
+                    + self.flop_weight      * total_flop_energy
+                    + self.repulsion_weight * repulsion_energy)
 
-        return logits, loss, total_dist_energy, total_flop_energy, all_weights, all_dists
+        return logits, loss, total_dist_energy, total_flop_energy, repulsion_energy, all_weights, all_dists
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.seq_len:]
-            logits, _, _, _, _, _ = self(idx_cond)
+            logits, _, _, _, _, _, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
             probs = F.softmax(logits, dim=-1)
             next_tok = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, next_tok], dim=1)
         return idx
 
-    def get_distance_scales(self):
-        """
-        Return learned distance scales as a (n_layers, n_heads) numpy array.
-        Positive = local preference, near-zero = global, negative = anti-local.
-        """
-        import numpy as np
-        scales = []
-        for block in self.blocks:
-            scales.append(block.attn.distance_scales.detach().cpu().numpy())
-        return np.stack(scales)  # (n_layers, n_heads)
+    def get_token_positions(self):
+        """Return learned 3D positions as (vocab_size, d_space) numpy array."""
+        return self.token_positions.detach().cpu().numpy()
 
     def mean_attention_distance(self, all_weights, all_dists):
-        """Average sequence distance of attended tokens across all layers/heads."""
         total = 0.0
         for weights, dists in zip(all_weights, all_dists):
-            total += (weights * dists).sum(dim=-1).mean().item()
+            total += (weights * dists.unsqueeze(1)).sum(dim=-1).mean().item()
         return total / len(all_weights)
 
     def mean_attention_entropy(self, all_weights):
-        """Average entropy of attention distributions."""
         total = 0.0
         for weights in all_weights:
             total += -(weights * torch.log(weights + 1e-9)).sum(dim=-1).mean().item()

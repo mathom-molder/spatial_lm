@@ -1,11 +1,11 @@
 """
-Generate text and visualize learned distance scales.
+Generate text and visualize the learned token-space positions.
 
 Usage:
     python generate.py                             # generate 200 chars
     python generate.py --prompt "KING:"            # seed with a prompt
     python generate.py --temperature 0.8           # less random
-    python generate.py --visualize                 # show scale heatmap + attention
+    python generate.py --visualize                 # show token map + attention
     python generate.py --prompt "To be" --visualize --temperature 0.7
 """
 
@@ -14,8 +14,9 @@ import pickle
 import numpy as np
 import torch
 import matplotlib
-matplotlib.use('Agg')  # headless-safe; plt.show() is a no-op
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from model import SpatialLanguageModel
 
 
@@ -24,7 +25,6 @@ def load_model(checkpoint='checkpoint.pt', vocab_file='vocab.pkl'):
         vocab = pickle.load(f)
     ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False)
     model = SpatialLanguageModel(**ckpt['hparams'])
-    # Strip _orig_mod. prefix added by torch.compile when saving
     state_dict = ckpt['model_state']
     if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
         state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
@@ -33,57 +33,75 @@ def load_model(checkpoint='checkpoint.pt', vocab_file='vocab.pkl'):
     return model, vocab
 
 
-def visualize_distance_scales(model, save='distance_scales.png'):
+def visualize_token_positions(model, vocab, save='token_positions.png'):
     """
-    Plot the learned per-head distance scales as a heatmap.
+    Plot the learned 3D positions for each vocabulary token.
 
-    Rows = layers, columns = heads.
-    Warm colours (positive) = head prefers local attention.
-    Cool colours (negative) = head prefers long-range attention.
-    Near-zero = head behaves like standard attention.
+    Characters that frequently attend to each other should cluster together.
+    If the model learned meaningful linguistic structure, expect:
+      - Vowels to cluster (they follow consonants predictably)
+      - Uppercase letters to cluster (they follow newlines/spaces)
+      - Punctuation to form its own group
+      - Digits to cluster
 
-    This is the key diagnostic: did the model learn to specialise heads?
+    Colour key: blue=uppercase, orange=lowercase, green=digit, red=other
     """
-    scales = model.get_distance_scales()  # (n_layers, n_heads)
-    n_layers, n_heads = scales.shape
+    itos = vocab['itos']
+    pos = model.get_token_positions()  # (vocab_size, 3)
+    vocab_size = pos.shape[0]
 
-    fig, ax = plt.subplots(figsize=(max(6, n_heads * 0.8), max(4, n_layers * 0.8)))
-    vmax = max(abs(scales.max()), abs(scales.min()), 0.01)
-    im = ax.imshow(scales, cmap='RdBu_r', vmin=-vmax, vmax=vmax, aspect='auto')
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
 
-    # Annotate each cell with its value
-    for i in range(n_layers):
-        for j in range(n_heads):
-            ax.text(j, i, f'{scales[i, j]:.3f}', ha='center', va='center',
-                    fontsize=8, color='black')
+    color_map = {'upper': 'royalblue', 'lower': 'darkorange',
+                 'digit': 'green',     'other': 'crimson'}
+    colors, labels = [], []
+    for i in range(vocab_size):
+        c = itos[i]
+        if c.isupper():
+            colors.append(color_map['upper'])
+        elif c.islower():
+            colors.append(color_map['lower'])
+        elif c.isdigit():
+            colors.append(color_map['digit'])
+        else:
+            colors.append(color_map['other'])
+        labels.append(repr(c) if c in (' ', '\n', '\t', '\r') else c)
 
-    ax.set_xlabel('Head')
-    ax.set_ylabel('Layer')
-    ax.set_xticks(range(n_heads))
-    ax.set_yticks(range(n_layers))
-    ax.set_xticklabels([f'H{h}' for h in range(n_heads)])
-    ax.set_yticklabels([f'L{l}' for l in range(n_layers)])
-    plt.colorbar(im, ax=ax, label='distance_scale (+ = local, − = global)')
-    ax.set_title('Learned per-head distance scales\n'
-                 'Red = local preference  |  Blue = global preference  |  White = standard')
+    ax.scatter(pos[:, 0], pos[:, 1], pos[:, 2], c=colors, s=80, alpha=0.8, depthshade=True)
+
+    for i in range(vocab_size):
+        ax.text(pos[i, 0], pos[i, 1], pos[i, 2], labels[i], fontsize=7, alpha=0.85)
+
+    ax.set_title('Learned 3D token positions\n'
+                 'Blue=uppercase  Orange=lowercase  Green=digit  Red=punctuation/space')
+    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+
     plt.tight_layout()
     plt.savefig(save, dpi=150, bbox_inches='tight')
     print(f"Saved → {save}")
-    plt.show()
 
-    # Print summary
-    print(f"\nDistance scale summary:")
-    print(f"  min={scales.min():.4f}  max={scales.max():.4f}  mean={scales.mean():.4f}")
-    print(f"  Local heads  (scale > 0.2): {(scales > 0.2).sum()}/{scales.size}")
-    print(f"  Global heads (scale < 0.0): {(scales < 0.0).sum()}/{scales.size}")
+    # Report pairwise distances for interesting character pairs
+    stoi = vocab['stoi']
+    print("\nPairwise token-space distances:")
+    pairs = [
+        ('t', 'h'), ('i', 'n'), ('e', 'r'), ('a', 'n'),  # common bigrams
+        ('e', 'a'), ('e', 'i'), ('a', 'o'),               # vowel pairs
+        (' ', '\n'), ('.', ','), ('!', '?'),               # punctuation pairs
+    ]
+    for a, b in pairs:
+        if a in stoi and b in stoi:
+            ia, ib = stoi[a], stoi[b]
+            d = np.linalg.norm(pos[ia] - pos[ib])
+            print(f"  {a!r} ↔ {b!r}: {d:.3f}")
 
 
 def visualize_attention(model, text, vocab, save='attention_maps.png'):
     """
-    Show attention weight matrices and distance-weighted attention for a text snippet.
+    Show attention weight matrices and token-distance-weighted attention.
 
-    Top row: raw attention weights (what position attends to what)
-    Bottom row: attention * distance (the energy spent per attention step)
+    Top row: raw attention weights
+    Bottom row: attention × token-distance (metabolic cost per step)
     """
     stoi = vocab['stoi']
     itos = vocab['itos']
@@ -93,7 +111,7 @@ def visualize_attention(model, text, vocab, save='attention_maps.png'):
     idx = torch.tensor(tokens).unsqueeze(0)
 
     with torch.no_grad():
-        _, _, _, _, all_weights, all_dists = model(idx)
+        _, _, _, _, _, all_weights, all_dists = model(idx)
 
     n_layers = len(all_weights)
     n_heads = all_weights[0].shape[1]
@@ -106,19 +124,19 @@ def visualize_attention(model, text, vocab, save='attention_maps.png'):
 
     col = 0
     for l in range(n_layers):
-        dists = all_dists[l].cpu().numpy()[:T, :T]
+        # all_dists[l] is (B, T, T); B=1 here
+        dists = all_dists[l][0].cpu().numpy()[:T, :T]
         for h in range(n_heads):
             w = all_weights[l][0, h, :T, :T].cpu().numpy()
             energy_map = w * dists
 
-            # Raw attention
             axes[0, col].imshow(w, cmap='Blues', vmin=0, vmax=w.max())
-            axes[0, col].set_title(f'L{l}H{h}\nscale={model.blocks[l].attn.distance_scales[h].item():.3f}',
-                                   fontsize=7)
-            axes[0, col].set_xticks(range(T)); axes[0, col].set_xticklabels(labels, fontsize=5, rotation=90)
-            axes[0, col].set_yticks(range(T)); axes[0, col].set_yticklabels(labels, fontsize=5)
+            axes[0, col].set_title(f'L{l}H{h}\nattention', fontsize=7)
+            axes[0, col].set_xticks(range(T))
+            axes[0, col].set_xticklabels(labels, fontsize=5, rotation=90)
+            axes[0, col].set_yticks(range(T))
+            axes[0, col].set_yticklabels(labels, fontsize=5)
 
-            # Energy (attention * distance)
             axes[1, col].imshow(energy_map, cmap='Reds', vmin=0)
             axes[1, col].set_title(f'L{l}H{h}\nenergy (w×dist)', fontsize=7)
             axes[1, col].set_xticks([]); axes[1, col].set_yticks([])
@@ -129,7 +147,6 @@ def visualize_attention(model, text, vocab, save='attention_maps.png'):
     plt.tight_layout()
     plt.savefig(save, dpi=150, bbox_inches='tight')
     print(f"Saved → {save}")
-    plt.show()
 
 
 def main():
@@ -154,7 +171,7 @@ def main():
     print('─' * 60)
 
     if args.visualize:
-        visualize_distance_scales(model)
+        visualize_token_positions(model, vocab)
         visualize_attention(model, text, vocab)
 
 
