@@ -155,6 +155,11 @@ class SpatialLanguageModel(nn.Module):
             torch.randn(vocab_size, d_space) * 0.3
         )
 
+        # Projects 3D token positions into embedding space so the model can
+        # use spatial neighbourhood as part of its representation, not just
+        # as an attention penalty.
+        self.pos_proj = nn.Linear(d_space, d_model, bias=False)
+
         self.blocks = nn.ModuleList([
             SpatialBlock(d_model, n_heads, seq_len, distance_penalty, dropout)
             for _ in range(n_layers)
@@ -194,9 +199,13 @@ class SpatialLanguageModel(nn.Module):
 
         # Look up 3D positions for each token in the sequence,
         # then compute all pairwise distances in one shot.
-        seq_pos = self.token_positions[idx]           # (B, T, d_space)
-        diff = seq_pos.unsqueeze(2) - seq_pos.unsqueeze(1)  # (B, T, T, d_space)
-        token_dists = torch.norm(diff, dim=-1)        # (B, T, T)
+        seq_pos = self.token_positions[idx]                       # (B, T, d_space)
+        diff = seq_pos.unsqueeze(2) - seq_pos.unsqueeze(1)        # (B, T, T, d_space)
+        token_dists = torch.norm(diff, dim=-1)                    # (B, T, T)
+
+        # Add projected positions to the embedding so the model can use
+        # spatial neighbourhood as part of its representation.
+        x = x + self.pos_proj(seq_pos)                           # (B, T, d_model)
 
         repulsion_energy = self._repulsion_energy()
 
