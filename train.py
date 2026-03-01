@@ -138,8 +138,8 @@ def train(args):
     scaler = GradScaler(enabled=(device == 'cuda' and dtype == torch.float16))
 
     start_step = 0
-    if args.resume and os.path.exists(CHECKPOINT_FILE):
-        ckpt = torch.load(CHECKPOINT_FILE, map_location=device, weights_only=False)
+    if args.resume and os.path.exists(args.checkpoint):
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(ckpt['model_state'])
         optimizer.load_state_dict(ckpt['optimizer_state'])
         start_step = ckpt['step'] + 1
@@ -192,9 +192,9 @@ def train(args):
                     'repulsion_weight': args.repulsion_weight,
                     'dropout': args.dropout,
                 },
-            }, CHECKPOINT_FILE)
+            }, args.checkpoint)
 
-    print(f"\nDone. Checkpoint saved to {CHECKPOINT_FILE}")
+    print(f"\nDone. Checkpoint saved to {args.checkpoint}")
 
 
 def main():
@@ -214,6 +214,7 @@ def main():
     p.add_argument('--lr',               type=float, default=LEARNING_RATE)
     p.add_argument('--max_steps',        type=int,   default=MAX_STEPS)
     p.add_argument('--eval_interval',    type=int,   default=EVAL_INTERVAL)
+    p.add_argument('--checkpoint',       type=str,   default=CHECKPOINT_FILE)
     p.add_argument('--resume',           action='store_true')
     args = p.parse_args()
     train(args)
