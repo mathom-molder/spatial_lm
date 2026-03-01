@@ -1,11 +1,11 @@
 """
-Generate text and visualize learned spatial structure.
+Generate text and visualize learned distance scales.
 
 Usage:
     python generate.py                             # generate 200 chars
     python generate.py --prompt "KING:"            # seed with a prompt
     python generate.py --temperature 0.8           # less random
-    python generate.py --visualize                 # show spatial positions + attention
+    python generate.py --visualize                 # show scale heatmap + attention
     python generate.py --prompt "To be" --visualize --temperature 0.7
 """
 
@@ -13,8 +13,9 @@ import argparse
 import pickle
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use('Agg')  # headless-safe; plt.show() is a no-op
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from model import SpatialLanguageModel
 
 
@@ -23,49 +24,58 @@ def load_model(checkpoint='checkpoint.pt', vocab_file='vocab.pkl'):
         vocab = pickle.load(f)
     ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False)
     model = SpatialLanguageModel(**ckpt['hparams'])
-    model.load_state_dict(ckpt['model_state'])
+    # Strip _orig_mod. prefix added by torch.compile when saving
+    state_dict = ckpt['model_state']
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
     return model, vocab
 
 
-def visualize_spatial(model, save='spatial_positions.png'):
+def visualize_distance_scales(model, save='distance_scales.png'):
     """
-    Plot the learned 3D spatial positions for each sequence position in each layer.
+    Plot the learned per-head distance scales as a heatmap.
 
-    Positions that frequently attend to each other get pulled close by the gradient.
-    You should see local structure emerge: adjacent positions cluster together,
-    while positions that need long-range context sit farther apart.
+    Rows = layers, columns = heads.
+    Warm colours (positive) = head prefers local attention.
+    Cool colours (negative) = head prefers long-range attention.
+    Near-zero = head behaves like standard attention.
+
+    This is the key diagnostic: did the model learn to specialise heads?
     """
-    n_layers = len(model.blocks)
-    fig = plt.figure(figsize=(6 * n_layers, 5))
+    scales = model.get_distance_scales()  # (n_layers, n_heads)
+    n_layers, n_heads = scales.shape
 
-    for layer in range(n_layers):
-        pos = model.get_spatial_positions(layer)  # (seq_len, 3)
-        seq_len = pos.shape[0]
+    fig, ax = plt.subplots(figsize=(max(6, n_heads * 0.8), max(4, n_layers * 0.8)))
+    vmax = max(abs(scales.max()), abs(scales.min()), 0.01)
+    im = ax.imshow(scales, cmap='RdBu_r', vmin=-vmax, vmax=vmax, aspect='auto')
 
-        ax = fig.add_subplot(1, n_layers, layer + 1, projection='3d')
-        colors = plt.cm.plasma(np.linspace(0, 1, seq_len))
-        sc = ax.scatter(pos[:, 0], pos[:, 1], pos[:, 2], c=colors, s=25, alpha=0.8)
+    # Annotate each cell with its value
+    for i in range(n_layers):
+        for j in range(n_heads):
+            ax.text(j, i, f'{scales[i, j]:.3f}', ha='center', va='center',
+                    fontsize=8, color='black')
 
-        # Label a few positions so you can see the ordering
-        step = max(1, seq_len // 10)
-        for i in range(0, seq_len, step):
-            ax.text(pos[i, 0], pos[i, 1], pos[i, 2], str(i), fontsize=6, alpha=0.7)
-
-        # Draw lines between consecutive positions to show the sequence path
-        for i in range(seq_len - 1):
-            ax.plot([pos[i, 0], pos[i+1, 0]],
-                    [pos[i, 1], pos[i+1, 1]],
-                    [pos[i, 2], pos[i+1, 2]],
-                    'gray', alpha=0.15, linewidth=0.5)
-
-        ax.set_title(f'Layer {layer} — learned positions\n(plasma: early→late)')
-        ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-
+    ax.set_xlabel('Head')
+    ax.set_ylabel('Layer')
+    ax.set_xticks(range(n_heads))
+    ax.set_yticks(range(n_layers))
+    ax.set_xticklabels([f'H{h}' for h in range(n_heads)])
+    ax.set_yticklabels([f'L{l}' for l in range(n_layers)])
+    plt.colorbar(im, ax=ax, label='distance_scale (+ = local, − = global)')
+    ax.set_title('Learned per-head distance scales\n'
+                 'Red = local preference  |  Blue = global preference  |  White = standard')
     plt.tight_layout()
     plt.savefig(save, dpi=150, bbox_inches='tight')
     print(f"Saved → {save}")
     plt.show()
+
+    # Print summary
+    print(f"\nDistance scale summary:")
+    print(f"  min={scales.min():.4f}  max={scales.max():.4f}  mean={scales.mean():.4f}")
+    print(f"  Local heads  (scale > 0.2): {(scales > 0.2).sum()}/{scales.size}")
+    print(f"  Global heads (scale < 0.0): {(scales < 0.0).sum()}/{scales.size}")
 
 
 def visualize_attention(model, text, vocab, save='attention_maps.png'):
@@ -83,7 +93,7 @@ def visualize_attention(model, text, vocab, save='attention_maps.png'):
     idx = torch.tensor(tokens).unsqueeze(0)
 
     with torch.no_grad():
-        _, _, _, _, _, all_weights, all_dists = model(idx)
+        _, _, _, _, all_weights, all_dists = model(idx)
 
     n_layers = len(all_weights)
     n_heads = all_weights[0].shape[1]
@@ -103,11 +113,12 @@ def visualize_attention(model, text, vocab, save='attention_maps.png'):
 
             # Raw attention
             axes[0, col].imshow(w, cmap='Blues', vmin=0, vmax=w.max())
-            axes[0, col].set_title(f'L{l}H{h}\nattention', fontsize=7)
+            axes[0, col].set_title(f'L{l}H{h}\nscale={model.blocks[l].attn.distance_scales[h].item():.3f}',
+                                   fontsize=7)
             axes[0, col].set_xticks(range(T)); axes[0, col].set_xticklabels(labels, fontsize=5, rotation=90)
             axes[0, col].set_yticks(range(T)); axes[0, col].set_yticklabels(labels, fontsize=5)
 
-            # Energy (attention * distance) — shows where metabolic cost is paid
+            # Energy (attention * distance)
             axes[1, col].imshow(energy_map, cmap='Reds', vmin=0)
             axes[1, col].set_title(f'L{l}H{h}\nenergy (w×dist)', fontsize=7)
             axes[1, col].set_xticks([]); axes[1, col].set_yticks([])
@@ -115,38 +126,6 @@ def visualize_attention(model, text, vocab, save='attention_maps.png'):
             col += 1
 
     fig.suptitle(f'Attention and energy maps for: "{text[:30]}..."')
-    plt.tight_layout()
-    plt.savefig(save, dpi=150, bbox_inches='tight')
-    print(f"Saved → {save}")
-    plt.show()
-
-
-def visualize_distance_distribution(model, save='distance_dist.png'):
-    """
-    Plot the distribution of learned pairwise distances in each layer.
-
-    If distance_penalty is working, you should see the distribution shift
-    over training — positions cluster for local attention, separate for global.
-    """
-    n_layers = len(model.blocks)
-    fig, axes = plt.subplots(1, n_layers, figsize=(5 * n_layers, 4))
-    if n_layers == 1:
-        axes = [axes]
-
-    for layer in range(n_layers):
-        pos = model.get_spatial_positions(layer)
-        # All pairwise distances
-        diff = pos[:, None, :] - pos[None, :, :]
-        dists = np.linalg.norm(diff, axis=-1).flatten()
-        dists = dists[dists > 0]  # remove self-distances
-
-        axes[layer].hist(dists, bins=40, color='steelblue', alpha=0.8)
-        axes[layer].axvline(dists.mean(), color='red', linestyle='--',
-                            label=f'mean={dists.mean():.2f}')
-        axes[layer].set_title(f'Layer {layer} pairwise distances')
-        axes[layer].set_xlabel('distance'); axes[layer].set_ylabel('count')
-        axes[layer].legend()
-
     plt.tight_layout()
     plt.savefig(save, dpi=150, bbox_inches='tight')
     print(f"Saved → {save}")
@@ -175,9 +154,8 @@ def main():
     print('─' * 60)
 
     if args.visualize:
-        visualize_spatial(model)
+        visualize_distance_scales(model)
         visualize_attention(model, text, vocab)
-        visualize_distance_distribution(model)
 
 
 if __name__ == '__main__':

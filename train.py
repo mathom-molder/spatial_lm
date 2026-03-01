@@ -9,14 +9,14 @@ GPU run (3090 or similar — recommended settings):
                     --batch_size 128 --max_steps 50000
 
 Ablations:
-    # Standard transformer baseline (no spatial costs)
-    python train.py --distance_penalty 0 --energy_weight 0 --flop_weight 0 --repulsion_weight 0
+    # Standard transformer baseline (no distance scaling)
+    python train.py --distance_scale_init 0 --energy_weight 0 --flop_weight 0
 
-    # Distance + repulsion only (no FLOP pressure)
-    python train.py --flop_weight 0
+    # Let scales learn freely from CE only (recommended first run)
+    python train.py --energy_weight 0 --flop_weight 0
 
-    # See effect of repulsion alone
-    python train.py --energy_weight 0 --flop_weight 0 --repulsion_weight 0.1
+    # Add explicit locality pressure in the loss
+    python train.py --energy_weight 0.01
 """
 
 import os
@@ -26,34 +26,27 @@ import pickle
 import argparse
 import numpy as np
 import torch
+from torch.cuda.amp import GradScaler
 from model import SpatialLanguageModel
 
 
 # ── CPU defaults (safe on any machine) ──────────────────────────────────────
-SEQ_LEN          = 128
-BATCH_SIZE       = 32
-D_MODEL          = 128
-N_HEADS          = 4
-N_LAYERS         = 4
-D_SPACE          = 3
-DISTANCE_PENALTY = 1.0
-ENERGY_WEIGHT    = 0.01
-FLOP_WEIGHT      = 0.1
-REPULSION_WEIGHT = 0.01   # Coulomb-style 1/d repulsion — prevents position collapse
-DROPOUT          = 0.1
-LEARNING_RATE    = 3e-4
-MAX_STEPS        = 10_000
-EVAL_INTERVAL    = 500
-EVAL_BATCHES     = 20
-DATA_FILE        = 'data/input.txt'
-CHECKPOINT_FILE  = 'checkpoint.pt'
-VOCAB_FILE       = 'vocab.pkl'
-
-# ── Recommended GPU settings (uncomment and paste as --args, or edit above) ─
-# --d_model 512 --n_heads 8 --n_layers 8 --seq_len 256
-# --batch_size 128 --max_steps 50000 --eval_interval 1000
-# (trains in ~40 min on a 3090, ~25M params)
-# ────────────────────────────────────────────────────────────────────────────
+SEQ_LEN               = 128
+BATCH_SIZE            = 32
+D_MODEL               = 128
+N_HEADS               = 4
+N_LAYERS              = 4
+DISTANCE_SCALE_INIT   = 0.1    # starting value for per-head distance scales
+ENERGY_WEIGHT         = 0.0    # penalty on avg attention distance (off by default)
+FLOP_WEIGHT           = 0.0    # penalty on attention entropy (off by default)
+DROPOUT               = 0.1
+LEARNING_RATE         = 3e-4
+MAX_STEPS             = 10_000
+EVAL_INTERVAL         = 500
+EVAL_BATCHES          = 20
+DATA_FILE             = 'data/input.txt'
+CHECKPOINT_FILE       = 'checkpoint.pt'
+VOCAB_FILE            = 'vocab.pkl'
 
 
 def load_data(path):
@@ -79,16 +72,15 @@ def estimate_loss(model, train_data, val_data, seq_len, batch_size, device, dtyp
     model.eval()
     results = {}
     for name, data in [('train', train_data), ('val', val_data)]:
-        losses, dist_es, flop_es, rep_es = [], [], [], []
+        losses, dist_es, flop_es = [], [], []
         for _ in range(EVAL_BATCHES):
             x, y = get_batch(data, seq_len, batch_size, device)
             with torch.autocast(device_type=device, dtype=dtype, enabled=(device == 'cuda')):
-                _, loss, dist_e, flop_e, rep_e, _, _ = model(x, y)
+                _, loss, dist_e, flop_e, _, _ = model(x, y)
             losses.append(loss.item())
             dist_es.append(dist_e.item())
             flop_es.append(flop_e.item())
-            rep_es.append(rep_e.item())
-        results[name] = (np.mean(losses), np.mean(dist_es), np.mean(flop_es), np.mean(rep_es))
+        results[name] = (np.mean(losses), np.mean(dist_es), np.mean(flop_es))
     model.train()
     return results
 
@@ -102,8 +94,7 @@ def cosine_schedule(step, max_steps, warmup=200, lr_min_ratio=0.1):
 
 def train(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # bfloat16 is numerically stable and fast on Ampere+ (3090 is Ampere)
-    dtype  = torch.bfloat16 if device == 'cuda' else torch.float32
+    dtype  = torch.float16 if device == 'cuda' else torch.float32
     print(f"Device: {device}  |  dtype: {dtype}")
 
     if not os.path.exists(args.data):
@@ -123,30 +114,26 @@ def train(args):
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        d_space=args.d_space,
-        distance_penalty=args.distance_penalty,
+        distance_scale_init=args.distance_scale_init,
         energy_weight=args.energy_weight,
         flop_weight=args.flop_weight,
-        repulsion_weight=args.repulsion_weight,
         dropout=args.dropout,
     ).to(device)
 
-    # torch.compile — big free speedup on PyTorch 2+ with CUDA
     if device == 'cuda' and hasattr(torch, 'compile'):
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
-    print(f"distance_penalty={args.distance_penalty}  energy_weight={args.energy_weight}  "
-          f"flop_weight={args.flop_weight}  repulsion_weight={args.repulsion_weight}\n")
+    print(f"distance_scale_init={args.distance_scale_init}  "
+          f"energy_weight={args.energy_weight}  flop_weight={args.flop_weight}\n")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: cosine_schedule(step, args.max_steps)
     )
-    # GradScaler only needed for float16, not bfloat16
-    scaler = torch.cuda.GradScaler(enabled=(device == 'cuda' and dtype == torch.float16))
+    scaler = GradScaler(enabled=(device == 'cuda' and dtype == torch.float16))
 
     start_step = 0
     if args.resume and os.path.exists(CHECKPOINT_FILE):
@@ -156,15 +143,15 @@ def train(args):
         start_step = ckpt['step'] + 1
         print(f"Resumed from step {start_step}")
 
-    print(f"{'Step':>8}  {'Train':>8}  {'Val':>8}  {'DistE':>7}  {'FlopE':>7}  {'RepE':>8}  {'AvgDist':>8}  {'Entropy':>8}")
-    print('─' * 82)
+    print(f"{'Step':>8}  {'Train':>8}  {'Val':>8}  {'DistE':>7}  {'FlopE':>7}  {'AvgDist':>8}  {'Entropy':>8}  {'Scales(min/max)':>16}")
+    print('─' * 95)
 
     t0 = time.time()
     for step in range(start_step, args.max_steps):
         x, y = get_batch(train_data, args.seq_len, args.batch_size, device)
 
         with torch.autocast(device_type=device, dtype=dtype, enabled=(device == 'cuda')):
-            _, loss, dist_e, flop_e, rep_e, all_weights, all_dists = model(x, y)
+            _, loss, dist_e, flop_e, all_weights, all_dists = model(x, y)
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -175,16 +162,18 @@ def train(args):
         scheduler.step()
 
         if (step + 1) % args.eval_interval == 0:
-            metrics    = estimate_loss(model, train_data, val_data,
-                                       args.seq_len, args.batch_size, device, dtype)
+            metrics     = estimate_loss(model, train_data, val_data,
+                                        args.seq_len, args.batch_size, device, dtype)
             avg_dist    = model.mean_attention_distance(all_weights, all_dists)
             avg_entropy = model.mean_attention_entropy(all_weights)
-            t_loss, t_dist_e, t_flop_e, t_rep_e = metrics['train']
+            scales      = model.get_distance_scales()  # (n_layers, n_heads)
+            t_loss, t_dist_e, t_flop_e = metrics['train']
             v_loss = metrics['val'][0]
             elapsed = time.time() - t0
             print(f"{step+1:>8}  {t_loss:>8.4f}  {v_loss:>8.4f}  "
-                  f"{t_dist_e:>7.4f}  {t_flop_e:>7.4f}  {t_rep_e:>8.2f}  "
-                  f"{avg_dist:>8.4f}  {avg_entropy:>8.4f}  ({elapsed:.0f}s)")
+                  f"{t_dist_e:>7.4f}  {t_flop_e:>7.4f}  "
+                  f"{avg_dist:>8.4f}  {avg_entropy:>8.4f}  "
+                  f"{scales.min():>7.3f}/{scales.max():>7.3f}  ({elapsed:.0f}s)")
 
             torch.save({
                 'step': step,
@@ -196,11 +185,9 @@ def train(args):
                     'd_model': args.d_model,
                     'n_heads': args.n_heads,
                     'n_layers': args.n_layers,
-                    'd_space': args.d_space,
-                    'distance_penalty': args.distance_penalty,
+                    'distance_scale_init': args.distance_scale_init,
                     'energy_weight': args.energy_weight,
                     'flop_weight': args.flop_weight,
-                    'repulsion_weight': args.repulsion_weight,
                     'dropout': args.dropout,
                 },
             }, CHECKPOINT_FILE)
@@ -210,22 +197,20 @@ def train(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--data',             default=DATA_FILE)
-    p.add_argument('--seq_len',          type=int,   default=SEQ_LEN)
-    p.add_argument('--batch_size',       type=int,   default=BATCH_SIZE)
-    p.add_argument('--d_model',          type=int,   default=D_MODEL)
-    p.add_argument('--n_heads',          type=int,   default=N_HEADS)
-    p.add_argument('--n_layers',         type=int,   default=N_LAYERS)
-    p.add_argument('--d_space',          type=int,   default=D_SPACE)
-    p.add_argument('--distance_penalty', type=float, default=DISTANCE_PENALTY)
-    p.add_argument('--energy_weight',    type=float, default=ENERGY_WEIGHT)
-    p.add_argument('--flop_weight',      type=float, default=FLOP_WEIGHT)
-    p.add_argument('--repulsion_weight', type=float, default=REPULSION_WEIGHT)
-    p.add_argument('--dropout',          type=float, default=DROPOUT)
-    p.add_argument('--lr',               type=float, default=LEARNING_RATE)
-    p.add_argument('--max_steps',        type=int,   default=MAX_STEPS)
-    p.add_argument('--eval_interval',    type=int,   default=EVAL_INTERVAL)
-    p.add_argument('--resume',           action='store_true')
+    p.add_argument('--data',                 default=DATA_FILE)
+    p.add_argument('--seq_len',              type=int,   default=SEQ_LEN)
+    p.add_argument('--batch_size',           type=int,   default=BATCH_SIZE)
+    p.add_argument('--d_model',              type=int,   default=D_MODEL)
+    p.add_argument('--n_heads',              type=int,   default=N_HEADS)
+    p.add_argument('--n_layers',             type=int,   default=N_LAYERS)
+    p.add_argument('--distance_scale_init',  type=float, default=DISTANCE_SCALE_INIT)
+    p.add_argument('--energy_weight',        type=float, default=ENERGY_WEIGHT)
+    p.add_argument('--flop_weight',          type=float, default=FLOP_WEIGHT)
+    p.add_argument('--dropout',              type=float, default=DROPOUT)
+    p.add_argument('--lr',                   type=float, default=LEARNING_RATE)
+    p.add_argument('--max_steps',            type=int,   default=MAX_STEPS)
+    p.add_argument('--eval_interval',        type=int,   default=EVAL_INTERVAL)
+    p.add_argument('--resume',               action='store_true')
     args = p.parse_args()
     train(args)
 
