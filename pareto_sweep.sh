@@ -10,7 +10,7 @@ MICROMAMBA="$HOME/.local/bin/micromamba"
 ENV="/mnt/research/micromamba/envs/spatial_lm"
 PY="$MICROMAMBA run -p $ENV python -u"
 
-DATA=data/python_stdlib.txt
+DATA=data/code.txt
 STEPS=10000
 SEQ=256
 BATCH=64
